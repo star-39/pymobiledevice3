@@ -53,3 +53,6 @@ class RestoredClient(object):
 
     def recv(self):
         return self.service.recv_plist()
+
+    def get_hardware_info(self):
+        return self.query_value('HardwareInfo')['HardwareInfo']

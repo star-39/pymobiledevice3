@@ -114,7 +114,7 @@ class Restore:
         # this step sends requested chunks of data from various offsets to asr so
         # it can validate the filesystem before installing it
         logging.info('validating the filesystem')
-        with self.ipsw.open_path(self.recovery.get_component_path('OS')) as filesystem:
+        with self.ipsw.open_path(self.recovery.build_identity.get_component_path('OS')) as filesystem:
             asr.perform_validation(filesystem)
             logging.info('filesystem validated')
 
@@ -128,7 +128,7 @@ class Restore:
         is_recovery = args['IsRecoveryOS']
 
         # TODO: verify
-        return self.recovery.build_identity
+        return self.recovery.build_identity.to_dict()
 
     def send_buildidentity(self, message: dict):
         logging.info('About to send BuildIdentity Dict...')
@@ -145,20 +145,9 @@ class Restore:
         self._restored.send(req)
 
     def extract_global_manifest(self):
-        build_info = self.recovery.build_identity.get('Info')
-        if build_info is None:
-            raise PyMobileDevice3Exception('build identity does not contain an "Info" element')
-
-        device_class = build_info.get('DeviceClass')
-        if device_class is None:
-            raise PyMobileDevice3Exception('build identity does not contain an "DeviceClass" element')
-
-        macos_variant = build_info.get('MacOSVariant')
-        if macos_variant is None:
-            raise PyMobileDevice3Exception('build identity does not contain an "MacOSVariant" element')
-
         # The path of the global manifest is hardcoded. There's no pointer to in the build manifest.
-        return self.ipsw.get_global_manifest(macos_variant, device_class)
+        return self.ipsw.get_global_manifest(self.recovery.build_identity.get_macos_variant(),
+                                             self.recovery.build_identity.get_device_class())
 
     def send_personalized_boot_object(self, message: dict):
         image_name = message['Arguments']['ImageName']
@@ -172,18 +161,7 @@ class Restore:
         elif image_name == '__SystemVersion__':
             data = self.ipsw.get_system_version_plist()
         else:
-            # Get component path
-            path = None
-            if self.recovery.tss:
-                path = self.recovery.tss.get(component, {}).get('Path')
-                if path is None:
-                    logging.debug(f'NOTE: No path for component {component} in TSS, will fetch from build identity')
-
-            if path is None:
-                path = self.recovery.build_identity_get_component_path(component)
-
-            # Extract component
-            data = self.ipsw.get_data_from_path(component)
+            data = self.recovery.get_component_data(component)
 
             # Personalize IMG40
             data = self.recovery.personalize_component(component_name, data, self.recovery.tss)
@@ -263,7 +241,7 @@ class Restore:
 
     def send_nor(self, message: dict):
         logging.info('About to send NORData...')
-        llb_path = self.recovery.get_component_path('LLB')
+        llb_path = self.recovery.build_identity.get_component_path('LLB')
         llb_filename_offset = llb_path.find('LLB')
 
         if llb_filename_offset == -1:
@@ -278,15 +256,9 @@ class Restore:
             firmware_files = firmware.get_files()
         except KeyError:
             logging.info('Getting firmware manifest from build identity')
-            build_id_manifest = self.recovery.build_identity['Manifest']
-            for component, manifest_entry in build_id_manifest.items():
-                if isinstance(manifest_entry, dict):
-                    is_fw = plist_access_path(manifest_entry, ('Info', 'IsFirmwarePayload'), bool)
-                    loaded_by_iboot = plist_access_path(manifest_entry, ('Info', 'IsLoadedByiBoot'), bool)
-                    is_secondary_fw = plist_access_path(manifest_entry, ('Info', 'IsSecondaryFirmwarePayload'), bool)
-
-                    if is_fw or (is_secondary_fw and loaded_by_iboot):
-                        firmware_files[component] = plist_access_path(manifest_entry, ('Info', 'Path'))
+            components = self.recovery.build_identity.get_firmware_components()
+            for component in components:
+                firmware_files[component] = self.recovery.build_identity.get_component_path(component)
 
         component = 'LLB'
         component_data = self.ipsw.get_data_from_path(llb_path)
@@ -322,11 +294,8 @@ class Restore:
         req['NorImageData'] = norimage
 
         for component in ('RestoreSEP', 'SEP'):
-            path = self.recovery.get_component_path(component)
-            if path is not None:
-                component_data = self.ipsw.get_data_from_path(path)
-                personalized_data = self.recovery.personalize_component(component, component_data, self.recovery.tss)
-                req[f'{component}ImageData'] = personalized_data
+            personalized_data = self.recovery.get_personalized_component_data(component)
+            req[f'{component}ImageData'] = personalized_data
 
         logging.info('Sending NORData now...')
         self._restored.send(req)
@@ -506,17 +475,61 @@ class Restore:
         logging.info('Sending FDR Trust data now...')
         self._restored.send({})
 
-    def send_image_data(self, message, image_list_k, image_type_k, image_data_k):
+    def send_image_data_for_requested_list(self, matched_images, image_list_requested_name):
+        req = {image_list_requested_name: matched_images}
+        return req
+
+    def send_all_images_for_name(self, matched_images, image_data_k):
+        data_dict = {}
+        for image in matched_images:
+            data_dict[image] = self.recovery.get_personalized_component_data(image)
+        req = {image_data_k: data_dict}
+        return req
+
+    def send_specific_image_data(self, matched_images, image_name, image_data_name):
+        data = None
+        req = {}
+
+        for component in matched_images:
+            if image_name != component:
+                continue
+
+            data = self.recovery.get_personalized_component_data(component)
+
+        if data is None:
+            return req
+
+        req[image_data_name] = data
+        req['ImageName'] = image_name
+        return req
+
+    def send_image_data(self, message, image_list_requested_name, image_property_name, image_data_k):
+        arguments = message['Arguments']
+        image_name = arguments.get('ImageName')
+        image_list_requested = arguments.get(image_list_requested_name, False)
+        if image_property_name is None:
+            assert (arguments['ImageType'] is not None, "missing ImageType")
+            image_property_name = arguments['ImageType']
+
+        matched_images = self.recovery.build_identity.get_components_with_property(image_property_name)
+
+        if image_list_requested:
+            req = {image_list_requested_name: matched_images}
+        elif image_name is not None:
+            req = self.send_specific_image_data(matched_images, image_name, image_data_k)
+        else:
+            req = self.send_all_images_for_name(matched_images, image_data_k)
+        self._restored.send(req)
+
+    def send_image_data1(self, message, image_list_k, image_type_k, image_data_k):
         logging.debug(f'send_image_data: {message}')
         arguments = message['Arguments']
         want_image_list = arguments.get(image_list_k)
         image_name = arguments.get('ImageName')
 
         if image_type_k is None:
+            assert(arguments['ImageType'] is not None, "missing ImageType")
             image_type_k = arguments['ImageType']
-
-        if image_type_k is None:
-            raise PyMobileDevice3Exception('missing ImageType')
 
         if want_image_list is None and image_name is None:
             logging.info(f'About to send {image_data_k}...')
@@ -539,9 +552,7 @@ class Restore:
                     if image_name is None:
                         logging.info(f'found {image_type_k} component \'{component}\'')
 
-                    path = self.recovery.build_identity_get_component_path(component)
-                    component_data = self.ipsw.get_data_from_path(path)
-                    data = self.recovery.personalize_component(component, component_data, self.recovery.tss)
+                    data = self.recovery.get_personalized_component_data(component)
                     data_dict[component] = data
 
         req = dict()
@@ -573,13 +584,7 @@ class Restore:
             comp_name = 'SE,UpdatePayload'
         else:
             logging.warning(f'Unknown SE,ChipID {chip_id} detected. Restore might fail.')
-
-            if self.recovery.build_identity_has_component('SE,UpdatePayload'):
-                comp_name = 'SE,UpdatePayload'
-            elif self.recovery.build_identity_has_component('SE,Firmware'):
-                comp_name = 'SE,Firmware'
-            else:
-                raise NotImplementedError('Neither \'SE,Firmware\' nor \'SE,UpdatePayload\' found in build identity.')
+            comp_name = self.recovery.build_identity.guess_se_component_name()
 
         comp_path = self.recovery.get_component_path(comp_name)
         component_data = self.ipsw.get_data_from_path(comp_path)
@@ -878,7 +883,7 @@ class Restore:
                 pass
         logging.info('connected to restored service')
 
-        hardware_info = self._restored.query_value('HardwareInfo')['HardwareInfo']
+        hardware_info = self._restored.get_hardware_info()
 
         logging.info(f'hardware info: {hardware_info}')
         logging.info(f'version: {self._restored.version}')
@@ -907,7 +912,7 @@ class Restore:
             opts['SystemImageType'] = 'User'
             opts['UpdateBaseband'] = False
 
-            sep = self.recovery.build_identity['Manifest']['SEP'].get('Info')
+            sep = self.recovery.build_identity.get_component_info('SEP')
             if sep:
                 required_capacity = sep.get('RequiredCapacity')
                 if required_capacity:
@@ -924,7 +929,7 @@ class Restore:
         if self.recovery.restore_boot_args:
             opts['RestoreBootArgs'] = self.recovery.restore_boot_args
 
-        spp = self.recovery.build_identity['Info'].get('SystemPartitionPadding')
+        spp = self.recovery.build_identity.system_partition_padding
         if spp:
             spp = dict(spp)
         else:

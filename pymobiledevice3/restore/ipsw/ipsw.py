@@ -1,3 +1,4 @@
+import logging
 import plistlib
 import zipfile
 from contextlib import contextmanager
@@ -6,14 +7,82 @@ from io import BytesIO
 from pymobiledevice3.exceptions import PyMobileDevice3Exception
 
 
+class Component:
+    def __init__(self, name: str, component: dict):
+        self.name = name
+        self._component_dict = component
+        self.info = self._component_dict['Info']
+        self.path = self.info.get('Path')
+        self.is_loaded_by_iboot = self.info.get('IsLoadedByiBoot', False)
+        self.is_loaded_by_iboot_stage1 = self.info.get('IsLoadedByiBootStage1', False)
+        self.is_firmware_payload = self.info.get('IsFirmwarePayload', False)
+        self.is_secondary_firmware_payload = self.info.get('IsSecondaryFirmwarePayload', False)
+
+    def has_property(self, property):
+        return self.info.get(property) is True
+
+
+class BuildIdentityManifest:
+    def __init__(self, manifest: dict):
+        self._manifest = manifest
+        self._parse_components()
+
+    def _parse_components(self):
+        self.components = {}
+        for component in self._manifest:
+            self.components[component] = Component(component, self._manifest[component])
+
+
 class BuildIdentity:
     def __init__(self, build_identity: dict):
         self._build_identity_dict = build_identity
+        self._manifest = BuildIdentityManifest(self._build_identity_dict['Manifest'])
         self.device_class = self._build_identity_dict['Info']['DeviceClass'].lower()
         self.restore_behavior = self._build_identity_dict['Info']['RestoreBehavior']
+        self.system_partition_padding = self._build_identity_dict['Info'].get('SystemPartitionPadding')
+        self.macos_variant = self._build_identity_dict['Info'].get('MacOSVariant')
+
+    def get_component_info(self, component: str):
+        return self._manifest.components[component].info
 
     def get_component_path(self, component: str):
-        return self._build_identity_dict['Manifest'][component]['Info']['Path']
+        return self._manifest.components[component].path
+
+    def has_component(self, name):
+        return name in self._manifest.components
+
+    def guess_se_component_name(self):
+        if self.has_component('SE,UpdatePayload'):
+            comp_name = 'SE,UpdatePayload'
+        elif self.has_component('SE,Firmware'):
+            comp_name = 'SE,Firmware'
+        else:
+            raise NotImplementedError('Neither \'SE,Firmware\' nor \'SE,UpdatePayload\' found in build identity.')
+        return comp_name
+
+    def to_dict(self):
+        return self._build_identity_dict
+
+    def get_components_loaded_by_iboot(self):
+        components = []
+        for name, component in self._manifest.components.items():
+            if component.is_loaded_by_iboot and not component.is_loaded_by_iboot_stage1:
+                components.append(name)
+        return components
+
+    def get_firmware_components(self):
+        components = []
+        for name, component in self._manifest.components.items():
+            if component.is_firmware_payload or (component.is_secondary_firmware_payload and component.is_loaded_by_iboot):
+                components.append(name)
+        return components
+
+    def get_components_with_property(self, property):
+        components = []
+        for name, component in self._manifest.components.items():
+            if component.has_property(property):
+                components.append(name)
+        return components
 
 
 class BuildManifest:
@@ -27,10 +96,15 @@ class BuildManifest:
             self._build_identities.append(BuildIdentity(build_identity))
 
     def get_build_identity(self, device_class: str, restore_behavior: str):
+        logging.debug(f'scanning BuildManifest.plist for the correct BuildIdentity matching: {device_class} and '
+                      f'behavior: {restore_behavior}')
         for build_identity in self._build_identities:
             if build_identity.device_class == device_class and build_identity.restore_behavior == restore_behavior:
                 return build_identity
         raise PyMobileDevice3Exception('failed to find the correct BuildIdentity from the BuildManifest')
+
+    def get_build_version(self):
+        return self._manifest['ProductBuildVersion']
 
 
 class IPSW:

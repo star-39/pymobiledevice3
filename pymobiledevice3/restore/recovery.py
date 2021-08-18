@@ -11,21 +11,18 @@ from pymobiledevice3.exceptions import PyMobileDevice3Exception
 from pymobiledevice3.irecv import IRecv
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.restore.img4 import stitch_component
+from pymobiledevice3.restore.ipsw.ipsw import IPSW
 from pymobiledevice3.restore.tss import TSSRequest, TSSResponse
 
 
 class Recovery:
     def __init__(self, ipsw: BytesIO, lockdown: LockdownClient = None, irecv: IRecv = None, tss: dict = None,
                  offline=False):
-        self.ipsw = zipfile.ZipFile(ipsw)
+        self.ipsw = IPSW(ipsw)
         self.irecv = irecv  # type: IRecv
         self.lockdown = lockdown  # type: LockdownClient
         self.offline = offline
-
-        if tss is not None:
-            self.tss = TSSResponse(tss)
-        else:
-            self.tss = None
+        self.tss = TSSResponse(tss) if tss is not None else None
 
         if not self.is_image4_supported:
             raise NotImplementedError('is_image4_supported is False')
@@ -33,22 +30,8 @@ class Recovery:
         logging.info(f'connected device: <ecid: {self.ecid} hardware_model: {self.hardware_model} '
                      f'image4-support: {self.is_image4_supported}>')
 
-        self.build_identity = None
-
-        logging.debug('scanning BuildManifest.plist for the correct BuildIdentity')
-        self.build_manifest = plistlib.loads(self.ipsw.read('BuildManifest.plist'))
-        for build_identity in self.build_manifest['BuildIdentities']:
-            device_class = build_identity['Info']['DeviceClass'].lower()
-            restore_behavior = build_identity['Info']['RestoreBehavior']
-            logging.debug(f'iterating: class: {device_class} behavior: {restore_behavior}')
-            if (device_class == self.hardware_model) and (restore_behavior == 'Update'):
-                self.build_identity = build_identity
-                break
-
-        if self.build_identity is None:
-            raise PyMobileDevice3Exception('failed to find the correct BuildIdentity from the BuildManifest.plist')
-
-        self.build_major = int(self.build_manifest['ProductBuildVersion'][:2])
+        self.build_identity = self.ipsw.build_manifest.get_build_identity(self.hardware_model, 'Update')
+        self.build_major = int(self.ipsw.build_manifest.get_build_version()[:2])
 
     @cached_property
     def ecid(self):
@@ -119,7 +102,7 @@ class Recovery:
 
         for k in keys_to_copy:
             try:
-                v = self.build_identity[k]
+                v = self.build_identity.to_dict()[k]
                 if isinstance(v, str) and v.startswith('0x'):
                     v = int(v, 16)
                 parameters[k] = v
@@ -224,35 +207,28 @@ class Recovery:
     def build_identity_has_component(self, component):
         return component in self.build_identity['Manifest']
 
-    def build_identity_get_component_path(self, component):
-        return self.build_identity['Manifest'][component]['Info']['Path']
-
     def personalize_component(self, name, data, tss):
         # stitch ApImg4Ticket into IMG4 file
         blob = tss.ap_img4_ticket
         return stitch_component(name, data, blob)
 
-    def get_component_path(self, name):
-        path = None
+    def get_component_data(self, name):
         if self.tss:
             path = self.tss.get_path_by_entry(name)
+            if path is not None:
+                return self.ipsw.get_data_from_path(path)
 
-        if path is None:
-            logging.debug(f'NOTE: No path for component {name} in TSS, will fetch from build_identity')
+        logging.debug(f'NOTE: No path for component {name} in TSS, will fetch from build_identity')
+        return self.ipsw.get_component_data(self.build_identity, name)
 
-        path = self.build_identity_get_component_path(name)
-
-        if path is None:
-            raise PyMobileDevice3Exception(f'Failed to find component path for {name}')
-
-        return path
+    def get_personalized_component_data(self, name):
+        data = self.get_component_data(name)
+        return self.personalize_component(name, data, self.tss)
 
     def send_component(self, name):
         logging.info(f'sending {name}...')
-        path = self.get_component_path(name)
-        logging.debug(f'sending a patched version of: {path}')
 
-        data = self.ipsw.read(path)
+        data = self.get_component_data(name)
         signed_data = self.personalize_component(name, data, self.tss)
 
         self.irecv.send_buffer(signed_data)
@@ -274,17 +250,9 @@ class Recovery:
         self.irecv.send_command('bgcolor 0 0 0')
 
     def send_loaded_by_iboot(self):
-        manifest = self.build_identity['Manifest']
-        for key, node in manifest.items():
-            iboot = node['Info'].get('IsLoadedByiBoot', False)
-            iboot_stg1 = node['Info'].get('IsLoadedByiBootStage1', False)
-
-            assert isinstance(iboot, bool)
-            assert isinstance(iboot_stg1, bool)
-
-            if iboot and not iboot_stg1:
-                logging.debug(f'{key} is loaded by iBoot')
-                self.send_component_and_command(key, 'firmware')
+        components = self.build_identity.get_components_loaded_by_iboot()
+        for component in components:
+            self.send_component_and_command(component, 'firmware')
 
     def send_ramdisk(self):
         component = 'RestoreRamDisk'
@@ -356,7 +324,7 @@ class Recovery:
         # send devicetree and load it
         self.send_component_and_command('RestoreDeviceTree', 'devicetree')
 
-        if 'RestoreSEP' in self.build_identity['Manifest']:
+        if self.build_identity.has_component('RestoreSEP'):
             # send rsepfirmware and load it
             self.send_component_and_command('RestoreSEP', 'rsepfirmware')
 
