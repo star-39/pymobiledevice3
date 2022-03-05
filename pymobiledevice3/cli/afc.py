@@ -31,6 +31,14 @@ def afc_pull(lockdown: LockdownClient, remote_file, local_file):
     local_file.write(AfcService(lockdown=lockdown).get_file_contents(remote_file))
 
 
+@afc.command('pull-dir', cls=Command)
+@click.argument('remote_dir', type=click.Path(exists=False))
+@click.argument('local_dir', type=click.Path(exists=False))
+def afc_pull_dir(lockdown: LockdownClient, remote_dir, local_dir: click.Path):
+    """ pull remote directory from /var/mobile/Media """
+    AfcService(lockdown=lockdown).pull(remote_dir, local_dir, )
+
+
 @afc.command('push', cls=Command)
 @click.argument('local_file', type=click.File('rb'))
 @click.argument('remote_file', type=click.Path(exists=False))

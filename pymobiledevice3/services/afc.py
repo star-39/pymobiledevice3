@@ -208,19 +208,38 @@ class AfcService(BaseService):
         super().__init__(lockdown, service_name)
         self.packet_num = 0
 
+    skip_count = 0
+
     def pull(self, relative_src, dst, callback=None, src_dir=''):
         src = posixpath.join(src_dir, relative_src)
         if callback is not None:
             callback(src, dst)
-
-        src = self.resolve_path(src)
-
-        if not self.isdir(src):
+        # src = self.resolve_path(src)
+        info = self.stat(src)
+        if info['st_ifmt'] == 'S_IFLNK':
+            target = info['LinkTarget']
+            if not target.startswith('/'):
+                # relative path
+                src = posixpath.join(posixpath.dirname(src), target)
+            else:
+                src = target
+        
+        if not info.get('st_ifmt') == 'S_IFDIR':
             # normal file
             if os.path.isdir(dst):
                 dst = os.path.join(dst, os.path.basename(relative_src))
-            with open(dst, 'wb') as f:
-                f.write(self.get_file_contents(src))
+
+            # check destination, skip existing.
+            if not os.path.exists(dst):
+                print(f'{src} --> {dst}')
+                with open(dst, 'wb') as f:
+                    f.write(self.get_file_contents(src))
+            else:
+                print("skipping " + dst)
+                self.skip_count += 1
+                if self.skip_count == 100:
+                    print("too many skips, terminating...")
+                    sys.exit()
         else:
             # directory
             dst_path = pathlib.Path(dst) / os.path.basename(relative_src)
@@ -320,7 +339,7 @@ class AfcService(BaseService):
 
     def listdir(self, filename):
         data = self._do_operation(afc_opcode_t.READ_DIR, afc_read_dir_req_t.build({'filename': filename}))
-        return afc_read_dir_resp_t.parse(data).filenames[2:]  # skip the . and ..
+        return sorted(afc_read_dir_resp_t.parse(data).filenames[2:], reverse=True)  # skip the . and ..
 
     def makedirs(self, filename):
         return self._do_operation(afc_opcode_t.MAKE_DIR, afc_mkdir_req_t.build({'filename': filename}))
